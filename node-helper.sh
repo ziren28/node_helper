@@ -1,45 +1,78 @@
 #!/usr/bin/env bash
 # ============================================================
-# node_helper V3.2 · Linux 管理脚本(单文件)
+# node_helper V3.2 · Linux 一键管理脚本(菜单版)
 #
-# 用法:
-#   bash node-helper.sh install [options]     安装(默认子命令,省略也行)
-#   bash node-helper.sh status                查看状态
-#   bash node-helper.sh uninstall [-y]        卸载
-#   bash node-helper.sh help                  显示帮助
+# 功能:安装 / 更新 / 状态 / 配置 / 卸载 / 脚本自更新
+# 依赖文件(intercept.cjs / .mjs / package.json / .env.example / prompts/)
+# 优先从同目录读;没有就从 GitHub 自动下载
 #
-# 安装选项:
-#   --wrapper      只挂 `claude` 命令(默认,推荐)
-#   --global       写 ~/.profile,所有 node 进程都挂(靠 intercept 门禁过滤)
-#   --esm          加载器用 intercept.mjs(默认)
-#   --cjs          加载器用 intercept.cjs(老兼容)
-#   --prefix DIR   安装目录,默认 ~/.local/share/node-helper
-#   --bin DIR      wrapper 放哪,默认 ~/.local/bin
+# 仓库:  https://github.com/ziren28/node_helper
+# 分支:  main
+#
+# 交互用法:
+#   bash node-helper.sh                            # 显示菜单
+#
+# 命令行用法:
+#   bash node-helper.sh install [--cjs|--esm] [--global|--wrapper]
+#   bash node-helper.sh update                     # 重拉最新依赖 + 更新安装
+#   bash node-helper.sh status                     # 状态
+#   bash node-helper.sh configure                  # 打开 $EDITOR 编辑 .env
+#   bash node-helper.sh uninstall [-y]             # 卸载
+#   bash node-helper.sh self-update                # 只更新本脚本
+#   bash node-helper.sh help
 # ============================================================
 set -uo pipefail
 
-# ---------- 共享变量 / 路径 ----------
-PREFIX_DEFAULT="$HOME/.local/share/node-helper"
-BIN_DEFAULT="$HOME/.local/bin"
+# ============================================================
+#  全局配置
+# ============================================================
+VERSION="3.2.0"
+REPO_OWNER="ziren28"
+REPO_NAME="node_helper"
+REPO_BRANCH="main"
+RAW_BASE="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${REPO_BRANCH}"
+
+# 默认下载路径列表(相对于 RAW_BASE)
+REMOTE_FILES=(
+  "intercept.cjs"
+  "intercept.mjs"
+  "package.json"
+  ".env.example"
+  "prompts/minimal_strip.txt"
+  "prompts/strip_reminders.txt"
+  "prompts/system.txt"
+  "prompts/system_patterns.txt"
+)
+
+# 本机路径
+PREFIX="${NODE_HELPER_PREFIX:-$HOME/.local/share/node-helper}"
+BIN_DIR="${NODE_HELPER_BIN:-$HOME/.local/bin}"
+WRAPPER="$BIN_DIR/claude"
 PROFILE="$HOME/.profile"
+CACHE_DIR="$HOME/.cache/node-helper-dl"
 MARK_BEGIN="# >>> node_helper V3.2 >>>"
 MARK_END="# <<< node_helper V3.2 <<<"
 
-PREFIX="${NODE_HELPER_PREFIX:-$PREFIX_DEFAULT}"
-BIN_DIR="${NODE_HELPER_BIN:-$BIN_DEFAULT}"
-WRAPPER="$BIN_DIR/claude"
-
-# 颜色(tty 才开)
+# TTY 颜色
 if [[ -t 1 ]]; then
-  OK=$'\033[32m✓\033[0m'; BAD=$'\033[31m✗\033[0m'
-  WARN=$'\033[33m⚠\033[0m'; DIM=$'\033[2m'; RST=$'\033[0m'
+  C_OK=$'\033[32m'; C_ERR=$'\033[31m'; C_WARN=$'\033[33m'
+  C_TITLE=$'\033[1;36m'; C_DIM=$'\033[2m'; C_RST=$'\033[0m'
 else
-  OK='[ok]'; BAD='[x]'; WARN='[!]'; DIM=''; RST=''
+  C_OK=''; C_ERR=''; C_WARN=''; C_TITLE=''; C_DIM=''; C_RST=''
 fi
+OK="${C_OK}✓${C_RST}"; BAD="${C_ERR}✗${C_RST}"; WARN="${C_WARN}⚠${C_RST}"
 
-# ---------- 通用工具 ----------
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+SCRIPT_PATH="$SCRIPT_DIR/$(basename "$0")"
+SELF_URL="$RAW_BASE/node-helper.sh"
+
+# ============================================================
+#  基础工具
+# ============================================================
 log()  { echo "$*"; }
-die()  { echo "[x] $*" >&2; exit 1; }
+hr()   { echo "${C_DIM}────────────────────────────────────────────────────────${C_RST}"; }
+die()  { echo "${BAD} $*" >&2; exit 1; }
+
 confirm() {
   local prompt="$1"
   [[ "${ASSUME_YES:-0}" == "1" ]] && return 0
@@ -47,16 +80,107 @@ confirm() {
   [[ "$ans" == "y" || "$ans" == "Y" ]]
 }
 
-usage() {
-  sed -n '2,18p' "$0" | sed 's/^# \?//'
+require_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# ============================================================
+#  HTTP 下载(curl 优先,wget 兜底)
+# ============================================================
+http_get() {
+  local url="$1" out="$2"
+  if require_cmd curl; then
+    curl -fsSL --connect-timeout 10 -o "$out" "$url"
+  elif require_cmd wget; then
+    wget -q -O "$out" "$url"
+  else
+    die "既没有 curl 也没有 wget,不能下载。请先 apt/yum install curl"
+  fi
+}
+
+http_get_str() {
+  local url="$1"
+  if require_cmd curl; then
+    curl -fsSL --connect-timeout 10 "$url"
+  elif require_cmd wget; then
+    wget -q -O - "$url"
+  else
+    return 1
+  fi
 }
 
 # ============================================================
-#  cmd_install
+#  源文件定位
+#    1) 脚本同目录  (scripts/linux + 依赖,自包含发行包)
+#    2) 仓库根       (开发模式:v3/ 下面)
+#    3) GitHub 下载  (纯脚本,现场拉取)
 # ============================================================
-cmd_install() {
-  local MODE="wrapper" LOADER="esm"
+locate_source() {
+  SRC_MODE=""
+  SRC_DIR=""
+  if [[ -f "$SCRIPT_DIR/intercept.cjs" ]]; then
+    SRC_MODE="local-self"
+    SRC_DIR="$SCRIPT_DIR"
+  elif [[ -f "$SCRIPT_DIR/../../intercept.cjs" ]]; then
+    SRC_MODE="local-repo"
+    SRC_DIR=$(cd "$SCRIPT_DIR/../.." && pwd)
+  else
+    SRC_MODE="remote"
+    SRC_DIR="$CACHE_DIR/src"
+  fi
+}
 
+# 把依赖文件放到 $1(目标目录);优先用本地源,找不到就下载
+materialize_sources() {
+  local dest="$1"
+  mkdir -p "$dest" "$dest/prompts"
+
+  if [[ "$SRC_MODE" != "remote" ]]; then
+    # 本地源,直接 cp
+    for f in "${REMOTE_FILES[@]}"; do
+      if [[ -f "$SRC_DIR/$f" ]]; then
+        mkdir -p "$dest/$(dirname "$f")"
+        cp -f "$SRC_DIR/$f" "$dest/$f"
+      else
+        log "  ${WARN} 本地没有 $f,跳过"
+      fi
+    done
+  else
+    # 远程:从 GitHub 拉
+    log "${C_DIM}从 GitHub 下载:${C_RST} $RAW_BASE"
+    for f in "${REMOTE_FILES[@]}"; do
+      mkdir -p "$dest/$(dirname "$f")"
+      if http_get "$RAW_BASE/$f" "$dest/$f"; then
+        log "  ${OK} $f"
+      else
+        log "  ${BAD} $f 下载失败"
+        return 1
+      fi
+    done
+  fi
+}
+
+# ============================================================
+#  版本检测
+# ============================================================
+read_local_version() {
+  local pj="$PREFIX/package.json"
+  [[ -f "$pj" ]] || { echo ""; return; }
+  # 纯 bash 解析 "version" 字段
+  grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' "$pj" 2>/dev/null \
+    | head -1 | sed 's/.*"\([^"]*\)"$/\1/'
+}
+
+read_remote_version() {
+  local pj
+  pj=$(http_get_str "$RAW_BASE/package.json" 2>/dev/null) || { echo ""; return; }
+  echo "$pj" | grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' \
+    | head -1 | sed 's/.*"\([^"]*\)"$/\1/'
+}
+
+# ============================================================
+#  [install] 真正执行安装;被菜单 / 命令行共用
+# ============================================================
+do_install() {
+  local MODE="wrapper" LOADER="esm"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --wrapper) MODE="wrapper"; shift;;
@@ -65,60 +189,39 @@ cmd_install() {
       --cjs)     LOADER="cjs"; shift;;
       --prefix)  PREFIX="$2"; shift 2;;
       --bin)     BIN_DIR="$2"; WRAPPER="$BIN_DIR/claude"; shift 2;;
-      *)         die "install: 未知参数 $1";;
+      *) die "install: 未知参数 $1";;
     esac
   done
 
-  # 环境检查
-  command -v node >/dev/null || die "需要 Node.js ≥ 18"
-  local nmaj
-  nmaj=$(node -p "process.versions.node.split('.')[0]")
-  [[ "$nmaj" -lt 18 ]] && die "Node 版本太低 ($nmaj),需要 ≥ 18"
+  require_cmd node || die "需要 Node.js ≥ 18"
+  local nmaj; nmaj=$(node -p "process.versions.node.split('.')[0]")
+  [[ "$nmaj" -lt 18 ]] && die "Node 版本太低($nmaj),需要 ≥ 18"
 
-  # 定位源:优先同目录(自包含发行),其次仓库根(开发模式)
-  local SCRIPT_DIR REPO_DIR SRC_MODE
-  SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-  if [[ -f "$SCRIPT_DIR/intercept.cjs" ]]; then
-    REPO_DIR="$SCRIPT_DIR"
-    SRC_MODE="自包含(同目录)"
-  elif [[ -f "$SCRIPT_DIR/../../intercept.cjs" ]]; then
-    REPO_DIR=$(cd "$SCRIPT_DIR/../.." && pwd)
-    SRC_MODE="仓库根"
-  else
-    die "找不到 intercept.cjs;既不在 $SCRIPT_DIR 也不在 $SCRIPT_DIR/../.."
-  fi
-
-  if [[ "$LOADER" == "esm" && ! -f "$REPO_DIR/intercept.mjs" ]]; then
-    log "${WARN} 没找到 intercept.mjs,回退到 CJS"
-    LOADER="cjs"
-  fi
-
-  log "=========================================="
-  log " node_helper V3.2 · install"
-  log "=========================================="
-  log "  模式:    $MODE"
-  log "  加载器:  $LOADER"
-  log "  源位置:  $SRC_MODE  ($REPO_DIR)"
-  log "  安装到:  $PREFIX"
-  [[ "$MODE" == "wrapper" ]] && log "  wrapper: $WRAPPER"
+  locate_source
+  log ""
+  log "${C_TITLE}━━━ 安装 ━━━${C_RST}"
+  log "  模式:      $MODE"
+  log "  加载器:    $LOADER"
+  case "$SRC_MODE" in
+    local-self) log "  源位置:    本地同目录" ;;
+    local-repo) log "  源位置:    本地仓库($SRC_DIR)" ;;
+    remote)     log "  源位置:    GitHub 远程" ;;
+  esac
+  log "  安装到:    $PREFIX"
+  [[ "$MODE" == "wrapper" ]] && log "  wrapper:   $WRAPPER"
   log ""
 
-  mkdir -p "$PREFIX"
-  cp -v "$REPO_DIR/intercept.cjs" "$PREFIX/"
-  [[ -f "$REPO_DIR/intercept.mjs" ]] && cp -v "$REPO_DIR/intercept.mjs" "$PREFIX/"
-  [[ -f "$REPO_DIR/package.json" ]]  && cp -v "$REPO_DIR/package.json"  "$PREFIX/"
-  [[ -f "$REPO_DIR/.env.example" ]]  && cp -v "$REPO_DIR/.env.example"  "$PREFIX/"
-  [[ -d "$REPO_DIR/prompts" ]]       && cp -rv "$REPO_DIR/prompts"      "$PREFIX/"
+  materialize_sources "$PREFIX" || die "依赖文件未齐备"
 
-  if [[ -f "$REPO_DIR/.env" && ! -f "$PREFIX/.env" ]]; then
-    cp -v "$REPO_DIR/.env" "$PREFIX/.env"
-  elif [[ ! -f "$PREFIX/.env" && -f "$PREFIX/.env.example" ]]; then
+  # .env 存在就保留,没有就从模板生成
+  if [[ ! -f "$PREFIX/.env" && -f "$PREFIX/.env.example" ]]; then
     cp "$PREFIX/.env.example" "$PREFIX/.env"
-    log "  ${OK} 已从 .env.example 生成 $PREFIX/.env"
+    log "  ${OK} 从 .env.example 生成默认 .env"
   fi
 
+  # 计算 NODE_OPTIONS flag
   local FLAG
-  if [[ "$LOADER" == "esm" ]]; then
+  if [[ "$LOADER" == "esm" && -f "$PREFIX/intercept.mjs" ]]; then
     FLAG="--import=file://$PREFIX/intercept.mjs"
   else
     FLAG="--require=$PREFIX/intercept.cjs"
@@ -129,7 +232,7 @@ cmd_install() {
     mkdir -p "$BIN_DIR"
     cat > "$WRAPPER" << WRAPEOF
 #!/usr/bin/env bash
-# node_helper V3.2 wrapper — 临时禁用:CLAUDE_INTERCEPT=off claude ...
+# node_helper V3.2 wrapper · 临时禁用: CLAUDE_INTERCEPT=off claude ...
 if [[ "\${CLAUDE_INTERCEPT:-on}" != "off" ]]; then
   export NODE_OPTIONS="$FLAG \${NODE_OPTIONS:-}"
 fi
@@ -151,8 +254,8 @@ WRAPEOF
     log ""
     log "${OK} 已装 wrapper: $WRAPPER"
     if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
-      log "${WARN} $BIN_DIR 不在 PATH,请把这行加到 ~/.bashrc 或 ~/.zshrc:"
-      log "       export PATH=\"$BIN_DIR:\$PATH\""
+      log "${WARN} $BIN_DIR 不在 PATH,追加到 ~/.bashrc 或 ~/.zshrc:"
+      log "     export PATH=\"$BIN_DIR:\$PATH\""
     fi
     ;;
 
@@ -161,228 +264,317 @@ WRAPEOF
     {
       echo ""
       echo "$MARK_BEGIN"
-      echo "# 自动加载 intercept,靠 intercept.cjs 内部 gate 只在 Claude 进程激活"
+      echo "# intercept.cjs 内部有 gate,只在 Claude 进程激活,其它 Node 0 影响"
       echo "export NODE_OPTIONS=\"$FLAG \${NODE_OPTIONS:-}\""
       echo "$MARK_END"
     } >> "$PROFILE"
     log ""
-    log "${OK} 已写入 $PROFILE(下次登录 / source ~/.profile 生效)"
+    log "${OK} 已写入 $PROFILE(下次登录 / source ~/.profile 后生效)"
     ;;
   esac
 
   log ""
-  log "完成。"
-  log "  自测: CLAUDE_INTERCEPT_DEBUG=1 claude --version"
-  log "  状态: bash $0 status"
-  log "  卸载: bash $0 uninstall"
+  log "${OK} 安装完成(版本 $VERSION)"
 }
 
 # ============================================================
-#  cmd_status
+#  [update]  = 拉最新依赖 + 再装一次
 # ============================================================
-cmd_status() {
+do_update() {
   log ""
-  log "====== node_helper V3.2 · 状态 ======"
-  log ""
+  log "${C_TITLE}━━━ 检查更新 ━━━${C_RST}"
+  local local_v remote_v
+  local_v=$(read_local_version)
+  log "  本地版本:  ${local_v:-(未安装)}"
+  remote_v=$(read_remote_version)
+  if [[ -z "$remote_v" ]]; then
+    log "  ${WARN} 无法拉到远程 package.json(网络/仓库问题)"
+  else
+    log "  远程版本:  $remote_v"
+    if [[ -n "$local_v" && "$local_v" == "$remote_v" ]]; then
+      log "  ${OK} 已是最新,无需更新"
+      confirm "仍然强制重装?" || return 0
+    fi
+  fi
 
-  # [1] 安装目录
+  # 强制远程下载
+  SRC_MODE="remote"; SRC_DIR="$CACHE_DIR/src"
+  mkdir -p "$SRC_DIR"
+  materialize_sources "$SRC_DIR" || die "依赖下载失败"
+
+  # 再用本地 cp 方式装(避免重复下载)
+  cp -rf "$SRC_DIR"/* "$PREFIX/" 2>/dev/null || true
+
+  # 刷新 wrapper(保持原模式)
+  if [[ -f "$WRAPPER" ]] && grep -q "node_helper" "$WRAPPER"; then
+    log "  ${OK} 更新完成,wrapper 保留"
+  else
+    log "  ${OK} 文件更新完成,未检测到 wrapper,跳过包装器更新"
+  fi
+}
+
+# ============================================================
+#  [status]
+# ============================================================
+do_status() {
+  log ""
+  log "${C_TITLE}━━━ 状态 ━━━${C_RST}"
+
   log "[1] 安装目录"
   if [[ -d "$PREFIX" ]]; then
     log "    $OK $PREFIX"
     for f in intercept.cjs intercept.mjs package.json .env; do
-      [[ -e "$PREFIX/$f" ]] && log "      $OK $f" || log "      $BAD $f 缺失"
+      [[ -e "$PREFIX/$f" ]] && log "      $OK $f" || log "      $BAD $f"
     done
     [[ -d "$PREFIX/prompts" ]] \
-      && log "      $OK prompts/ ($(ls "$PREFIX/prompts" 2>/dev/null | wc -l) 个文件)" \
+      && log "      $OK prompts/ ($(ls "$PREFIX/prompts" 2>/dev/null | wc -l) 个)" \
       || log "      $WARN prompts/ 缺失"
+    local lv; lv=$(read_local_version)
+    [[ -n "$lv" ]] && log "      版本:  $lv"
   else
-    log "    $BAD $PREFIX 不存在"
+    log "    $BAD 未安装"
   fi
 
-  # [2] wrapper
   log ""
-  log "[2] wrapper 模式"
-  if [[ -f "$WRAPPER" ]]; then
-    if grep -q "node_helper" "$WRAPPER" 2>/dev/null; then
-      log "    $OK $WRAPPER (是 node_helper)"
-      local opt
-      opt=$(grep -oE 'NODE_OPTIONS="[^"]+"' "$WRAPPER" | head -1 | sed 's/NODE_OPTIONS="//;s/"$//')
-      log "      ${DIM}注入: $opt${RST}"
-    else
-      log "    $WARN $WRAPPER 存在但不是我们的"
-    fi
+  log "[2] wrapper"
+  if [[ -f "$WRAPPER" ]] && grep -q "node_helper" "$WRAPPER"; then
+    log "    $OK $WRAPPER"
+    grep -oE 'NODE_OPTIONS="[^"]+"' "$WRAPPER" | head -1 | sed "s|^|      ${C_DIM}|;s|$|${C_RST}|"
   else
-    log "    ${DIM}(未装 wrapper)${RST}"
+    log "    ${C_DIM}(未装)${C_RST}"
   fi
 
-  # [3] global
   log ""
-  log "[3] 全局模式(~/.profile)"
+  log "[3] 全局 ~/.profile 注入"
   if grep -q "$MARK_BEGIN" "$PROFILE" 2>/dev/null; then
-    log "    $OK $PROFILE 已注入"
-    sed -n "/$MARK_BEGIN/,/$MARK_END/p" "$PROFILE" | sed 's/^/      /'
+    log "    $OK 有注入块"
   else
-    log "    ${DIM}(未注入)${RST}"
+    log "    ${C_DIM}(无)${C_RST}"
   fi
 
-  # [4] PATH 解析
   log ""
-  log "[4] PATH"
-  local wc
-  wc=$(command -v claude 2>/dev/null || echo "")
+  log "[4] PATH / which claude"
+  local wc; wc=$(command -v claude 2>/dev/null || echo "")
   if [[ -n "$wc" ]]; then
     log "    which claude → $wc"
     if [[ -f "$WRAPPER" ]]; then
       local a b
       a=$(realpath "$wc" 2>/dev/null || echo "$wc")
       b=$(realpath "$WRAPPER" 2>/dev/null || echo "$WRAPPER")
-      [[ "$a" == "$b" ]] && log "      $OK 是 node_helper 包装器" \
-                        || log "      $WARN 不是包装器(包装器可能不在 PATH 最前)"
-    fi
-    mapfile -t ALL < <(which -a claude 2>/dev/null || type -a -p claude 2>/dev/null)
-    if [[ ${#ALL[@]} -gt 1 ]]; then
-      log "    PATH 上共 ${#ALL[@]} 个 claude:"
-      for p in "${ALL[@]}"; do log "      - $p"; done
+      [[ "$a" == "$b" ]] && log "      $OK 是 node_helper" || log "      $WARN 不是 node_helper"
     fi
   else
-    log "    $BAD PATH 上找不到 claude"
+    log "    $BAD PATH 无 claude"
   fi
 
-  # [5] 当前 shell NODE_OPTIONS
   log ""
-  log "[5] 当前 shell NODE_OPTIONS"
-  if [[ -n "${NODE_OPTIONS:-}" ]]; then
-    log "    $OK $NODE_OPTIONS"
-  else
-    log "    ${DIM}(未设置 — wrapper 模式下属正常)${RST}"
-  fi
-
-  # [6] 门禁自测
-  log ""
-  log "[6] 门禁自测"
-  local ICJS=""
-  [[ -f "$PREFIX/intercept.cjs" ]] && ICJS="$PREFIX/intercept.cjs"
-  if [[ -n "$ICJS" ]]; then
-    local out
-    out=$(CLAUDE_INTERCEPT_DEBUG=1 node --require="$ICJS" \
-          -e "console.log('loaded='+!!globalThis.__NODE_HELPER_V3_LOADED__)" 2>&1 || true)
-    if echo "$out" | grep -q "skip"; then
-      log "    $OK 非 Claude 进程被跳过(gate 工作)"
-      echo "$out" | grep -E "ic v3|skip" | head -1 | sed 's/^/      /'
-    elif echo "$out" | grep -q "active"; then
-      log "    $WARN 被激活了 — 是否设了 CLAUDE_INTERCEPT_FORCE=1?"
-    else
-      log "    $WARN 未知:"; echo "$out" | head -3 | sed 's/^/      /'
-    fi
-  else
-    log "    ${DIM}跳过(没找到 intercept.cjs)${RST}"
-  fi
-
-  # [7] 伴随服务
-  log ""
-  log "[7] 伴随服务(viewer 8787 / addon 8799)"
-  local ports=""
-  if command -v ss >/dev/null 2>&1; then
+  log "[5] 伴随服务端口"
+  local ports
+  if require_cmd ss; then
     ports=$(ss -lntp 2>/dev/null | grep -E ':(8787|8799) ' || true)
   else
     ports=$(netstat -lntp 2>/dev/null | grep -E ':(8787|8799) ' || true)
   fi
-  if [[ -n "$ports" ]]; then
-    echo "$ports" | sed 's/^/    /'
-  else
-    log "    ${DIM}(都没监听,intercept 会降级到 LOG_FILE)${RST}"
+  [[ -n "$ports" ]] && echo "$ports" | sed 's/^/    /' || log "    ${C_DIM}(8787/8799 未监听)${C_RST}"
+
+  log ""
+  log "[6] 版本对比"
+  local lv rv
+  lv=$(read_local_version)
+  rv=$(read_remote_version)
+  log "    本地:  ${lv:-(未安装)}"
+  log "    远程:  ${rv:-(拉取失败)}"
+  if [[ -n "$lv" && -n "$rv" && "$lv" != "$rv" ]]; then
+    log "    $WARN 有更新:运行菜单第 2 项 或  bash $0 update"
+  elif [[ -n "$lv" && "$lv" == "$rv" ]]; then
+    log "    $OK 已是最新"
   fi
   log ""
 }
 
 # ============================================================
-#  cmd_uninstall
+#  [configure]
 # ============================================================
-cmd_uninstall() {
+do_configure() {
+  local envf="$PREFIX/.env"
+  if [[ ! -f "$envf" ]]; then
+    if [[ -f "$PREFIX/.env.example" ]]; then
+      cp "$PREFIX/.env.example" "$envf"
+      log "${OK} 已从模板生成 $envf"
+    else
+      die "$envf 不存在且无模板,先安装"
+    fi
+  fi
+  local EDIT="${EDITOR:-$(command -v nano || command -v vi || command -v vim)}"
+  [[ -z "$EDIT" ]] && die "未找到编辑器,请先设 \$EDITOR 或装 nano/vi"
+  log "${OK} 打开: $EDIT $envf"
+  "$EDIT" "$envf"
+}
+
+# ============================================================
+#  [uninstall]
+# ============================================================
+do_uninstall() {
   ASSUME_YES=0
   for a in "$@"; do
     case "$a" in -y|--yes) ASSUME_YES=1;; esac
   done
 
-  log "====== node_helper V3.2 · 卸载 ======"
   log ""
+  log "${C_TITLE}━━━ 卸载 ━━━${C_RST}"
 
-  # 1. wrapper
-  if [[ -f "$WRAPPER" ]] && grep -q "node_helper" "$WRAPPER" 2>/dev/null; then
-    if confirm "删除 wrapper $WRAPPER?"; then
-      rm -f "$WRAPPER"
-      log "  $OK 已删 $WRAPPER"
-    else
-      log "  skip  保留 $WRAPPER"
-    fi
-  elif [[ -f "$WRAPPER" ]]; then
-    log "  skip  $WRAPPER 不是我们的"
-  else
-    log "  skip  没 wrapper"
+  if [[ -f "$WRAPPER" ]] && grep -q "node_helper" "$WRAPPER"; then
+    confirm "删 wrapper  $WRAPPER ?" && { rm -f "$WRAPPER"; log "  $OK 已删"; } || log "  skip"
   fi
 
-  # 2. ~/.profile
   if grep -q "$MARK_BEGIN" "$PROFILE" 2>/dev/null; then
     if confirm "从 $PROFILE 移除 NODE_OPTIONS 注入?"; then
       cp "$PROFILE" "$PROFILE.bak.$(date +%Y%m%d-%H%M%S)"
       sed -i "/$MARK_BEGIN/,/$MARK_END/d" "$PROFILE"
-      log "  $OK 已从 $PROFILE 移除(备份 .bak.xxx)"
-      log "       本 shell 要重开或 'unset NODE_OPTIONS' 才立即生效"
-    else
-      log "  skip  保留 $PROFILE"
+      log "  $OK 已移除(备份 .bak.xxx)"
     fi
-  else
-    log "  skip  $PROFILE 没注入"
   fi
 
-  # 3. 安装目录
   if [[ -d "$PREFIX" ]]; then
-    log ""
-    log "  $PREFIX 内容:"
-    ls -la "$PREFIX" 2>/dev/null | sed 's/^/    /'
-    [[ -f "$PREFIX/.env" ]] && log "  $WARN .env 可能含你的自定义规则 / token"
-    if confirm "删除 $PREFIX?"; then
-      rm -rf "$PREFIX"
-      log "  $OK 已删 $PREFIX"
-    else
-      log "  skip  保留 $PREFIX"
-    fi
-  else
-    log "  skip  $PREFIX 已不存在"
+    [[ -f "$PREFIX/.env" ]] && log "  ${WARN} $PREFIX/.env 可能含你的配置"
+    confirm "删 $PREFIX ?" && { rm -rf "$PREFIX"; log "  $OK 已删"; } || log "  skip"
   fi
 
-  # 4. 日志
+  # 日志
   local logs=()
   for f in /tmp/node-helper-intercept.jsonl "$HOME/.cache/node-helper-intercept.jsonl"; do
     [[ -f "$f" ]] && logs+=("$f")
   done
   if [[ ${#logs[@]} -gt 0 ]]; then
-    log ""
-    log "  发现日志:"
-    for f in "${logs[@]}"; do log "    - $f ($(du -h "$f" 2>/dev/null | cut -f1))"; done
-    if confirm "删除日志?"; then
-      for f in "${logs[@]}"; do rm -f "$f"; done
-      log "  $OK 已清"
-    fi
+    confirm "清理 intercept 日志(${#logs[@]} 个)?" && { rm -f "${logs[@]}"; log "  $OK 已清"; }
   fi
 
+  # 下载缓存
+  [[ -d "$CACHE_DIR" ]] && confirm "清下载缓存 $CACHE_DIR ?" && rm -rf "$CACHE_DIR"
+
   log ""
-  log "卸载完成。which claude 现在指向:"
-  which claude 2>/dev/null | sed 's/^/  /' || log "  (PATH 上没 claude 了)"
+  log "卸载完成。which claude 当前 → $(command -v claude 2>/dev/null || echo '(无)')"
+}
+
+# ============================================================
+#  [self-update]  只更新本脚本
+# ============================================================
+do_self_update() {
+  log ""
+  log "${C_TITLE}━━━ 自更新 ━━━${C_RST}"
+  log "  当前脚本:  $SCRIPT_PATH"
+  local tmp="$CACHE_DIR/node-helper.sh.new"
+  mkdir -p "$CACHE_DIR"
+  if ! http_get "$SELF_URL" "$tmp"; then
+    die "下载 $SELF_URL 失败"
+  fi
+  if cmp -s "$SCRIPT_PATH" "$tmp" 2>/dev/null; then
+    log "  $OK 本脚本已是最新"
+    rm -f "$tmp"
+    return 0
+  fi
+  log "  ${WARN} 检测到新版本"
+  if confirm "用新版本替换 $SCRIPT_PATH ?"; then
+    cp "$SCRIPT_PATH" "$SCRIPT_PATH.bak.$(date +%Y%m%d-%H%M%S)"
+    mv "$tmp" "$SCRIPT_PATH"
+    chmod +x "$SCRIPT_PATH"
+    log "  $OK 已更新(原文件备份 .bak.xxx)"
+    log "  重新运行:  bash $SCRIPT_PATH"
+  else
+    rm -f "$tmp"
+    log "  skip"
+  fi
+}
+
+# ============================================================
+#  交互菜单
+# ============================================================
+show_banner() {
+  clear 2>/dev/null || printf '\n\n'
+  echo ""
+  echo "${C_TITLE}╔══════════════════════════════════════════════════════╗${C_RST}"
+  echo "${C_TITLE}║   node_helper V${VERSION} · Claude Code 拦截与改写         ║${C_RST}"
+  echo "${C_TITLE}║   github.com/${REPO_OWNER}/${REPO_NAME}${C_RST}                    "
+  echo "${C_TITLE}╚══════════════════════════════════════════════════════╝${C_RST}"
+  echo ""
+
+  # 简版状态
+  local lv inst_mark wrapper_mark
+  lv=$(read_local_version)
+  if [[ -d "$PREFIX" && -n "$lv" ]]; then
+    inst_mark="${OK} 已安装  (v$lv,$PREFIX)"
+  else
+    inst_mark="${C_DIM}未安装${C_RST}"
+  fi
+  if [[ -f "$WRAPPER" ]] && grep -q "node_helper" "$WRAPPER"; then
+    wrapper_mark="${OK} $WRAPPER"
+  else
+    wrapper_mark="${C_DIM}(未装)${C_RST}"
+  fi
+  echo "  安装状态:  $inst_mark"
+  echo "  wrapper :  $wrapper_mark"
+  echo ""
+}
+
+show_menu() {
+  show_banner
+  hr
+  echo "   1) 安装 / 重装         (首次安装或覆盖装)"
+  echo "   2) 更新                (检查远程版本,拉最新)"
+  echo "   3) 查看详细状态"
+  echo "   4) 编辑 .env 配置"
+  echo "   5) 卸载"
+  echo ""
+  echo "   6) 自更新此脚本        (从 GitHub 拉最新的 node-helper.sh)"
+  echo ""
+  echo "   0) 退出"
+  hr
+  read -r -p "  请选择 [0-6]: " choice
+  echo ""
+  case "$choice" in
+    1) do_install ;;
+    2) do_update ;;
+    3) do_status ;;
+    4) do_configure ;;
+    5) do_uninstall ;;
+    6) do_self_update ;;
+    0|q|Q) log "再见"; exit 0 ;;
+    *) log "${BAD} 无效选择"; sleep 1 ;;
+  esac
+  echo ""
+  read -r -p "  按回车回主菜单 ..."
+  show_menu
+}
+
+# ============================================================
+#  帮助
+# ============================================================
+usage() {
+  sed -n '2,23p' "$0" | sed 's/^# \?//'
 }
 
 # ============================================================
 #  分发
 # ============================================================
 main() {
-  local cmd="${1:-install}"
-  [[ $# -gt 0 ]] && shift
+  # 无参数 → 交互菜单
+  if [[ $# -eq 0 ]]; then
+    show_menu
+    return
+  fi
+
+  local cmd="$1"; shift
   case "$cmd" in
-    install)           cmd_install "$@" ;;
-    status|st)         cmd_status ;;
-    uninstall|remove)  cmd_uninstall "$@" ;;
-    help|-h|--help)    usage ;;
-    *)                 log "未知子命令: $cmd"; usage; exit 2 ;;
+    install)             do_install "$@" ;;
+    update|upgrade)      do_update ;;
+    status|st)           do_status ;;
+    configure|config)    do_configure ;;
+    uninstall|remove)    do_uninstall "$@" ;;
+    self-update)         do_self_update ;;
+    menu)                show_menu ;;
+    help|-h|--help)      usage ;;
+    version|-v|--version) echo "node_helper v$VERSION"; exit 0 ;;
+    *) log "${BAD} 未知子命令: $cmd"; usage; exit 2 ;;
   esac
 }
 
