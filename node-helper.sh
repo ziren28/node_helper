@@ -45,8 +45,15 @@ REMOTE_FILES=(
 )
 
 # 本机路径
+# root 默认 /usr/local/bin(在 /usr/bin 前,天然生效);普通用户 ~/.local/bin
+if [[ -n "${NODE_HELPER_BIN:-}" ]]; then
+  BIN_DIR="$NODE_HELPER_BIN"
+elif [[ "$(id -u 2>/dev/null)" == "0" ]]; then
+  BIN_DIR="/usr/local/bin"
+else
+  BIN_DIR="$HOME/.local/bin"
+fi
 PREFIX="${NODE_HELPER_PREFIX:-$HOME/.local/share/node-helper}"
-BIN_DIR="${NODE_HELPER_BIN:-$HOME/.local/bin}"
 WRAPPER="$BIN_DIR/claude"
 PROFILE="$HOME/.profile"
 CACHE_DIR="$HOME/.cache/node-helper-dl"
@@ -457,6 +464,173 @@ do_uninstall() {
 }
 
 # ============================================================
+#  [reset] 强制重置:清状态 -> 强制从 GitHub 下载 -> 重装 -> 激活
+#  无交互,适合一键修复挂载失败的情况
+# ============================================================
+do_reset() {
+  local MODE="wrapper" LOADER="esm"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --global) MODE="global"; shift;;
+      --cjs)    LOADER="cjs"; shift;;
+      --esm)    LOADER="esm"; shift;;
+      --bin)    BIN_DIR="$2"; WRAPPER="$BIN_DIR/claude"; shift 2;;
+      --prefix) PREFIX="$2"; shift 2;;
+      *) log "${WARN} 忽略未知参数: $1"; shift;;
+    esac
+  done
+
+  require_cmd node || die "需要 Node.js ≥ 18"
+
+  log ""
+  log "${C_TITLE}━━━ 强制重置(clean + remote pull + reinstall) ━━━${C_RST}"
+  log "  目标安装到:  $PREFIX"
+  log "  wrapper →    $WRAPPER"
+  log "  模式:        $MODE  +  $LOADER"
+  log ""
+
+  # [1] 清所有已知 wrapper 位置
+  log "${C_TITLE}[1/6]${C_RST} 清旧 wrapper"
+  local rm_count=0
+  for loc in \
+      "$HOME/.local/bin/claude" \
+      "/usr/local/bin/claude" \
+      "/usr/bin/claude-helper" \
+      "$WRAPPER"; do
+    if [[ -f "$loc" ]] && grep -q "node_helper" "$loc" 2>/dev/null; then
+      rm -f "$loc" && log "  ${OK} 删 $loc"
+      rm_count=$((rm_count + 1))
+    fi
+  done
+  [[ $rm_count -eq 0 ]] && log "  ${C_DIM}(无)${C_RST}"
+
+  # [2] 清 ~/.profile 注入
+  log "${C_TITLE}[2/6]${C_RST} 清 $PROFILE 注入块"
+  if grep -q "$MARK_BEGIN" "$PROFILE" 2>/dev/null; then
+    cp "$PROFILE" "$PROFILE.bak.$(date +%Y%m%d-%H%M%S)"
+    sed -i "/$MARK_BEGIN/,/$MARK_END/d" "$PROFILE"
+    log "  ${OK} 已移除(原文件备份 .bak.xxx)"
+  else
+    log "  ${C_DIM}(无)${C_RST}"
+  fi
+
+  # [3] 清安装目录
+  log "${C_TITLE}[3/6]${C_RST} 清安装目录 $PREFIX"
+  if [[ -d "$PREFIX" ]]; then
+    # 保留 .env(可能有用户配的 token / 规则)
+    local had_env=""
+    if [[ -f "$PREFIX/.env" ]]; then
+      had_env=$(mktemp)
+      cp "$PREFIX/.env" "$had_env"
+      log "  ${C_DIM}(保留 .env 备份到 $had_env)${C_RST}"
+    fi
+    rm -rf "$PREFIX"
+    log "  ${OK} 已删"
+    if [[ -n "$had_env" ]]; then
+      mkdir -p "$PREFIX"
+      cp "$had_env" "$PREFIX/.env"
+      rm -f "$had_env"
+      log "  ${OK} 已还原旧 .env"
+    fi
+  else
+    log "  ${C_DIM}(不存在)${C_RST}"
+  fi
+
+  # [4] 清下载缓存
+  log "${C_TITLE}[4/6]${C_RST} 清下载缓存 $CACHE_DIR"
+  rm -rf "$CACHE_DIR"
+  log "  ${OK} 已清"
+
+  # [5] 强制从 GitHub 下载
+  log "${C_TITLE}[5/6]${C_RST} 从 GitHub 强制下载"
+  SRC_MODE="remote"
+  SRC_DIR="$CACHE_DIR/src"
+  mkdir -p "$SRC_DIR"
+  materialize_sources "$SRC_DIR" || die "下载失败,请检查网络和仓库路径:$RAW_BASE"
+  mkdir -p "$PREFIX"
+  # 用 cp -a 保留时间戳,但不覆盖已还原的 .env
+  (cd "$SRC_DIR" && find . -type f | while read -r f; do
+    target="$PREFIX/${f#./}"
+    # .env 已还原就不覆盖
+    if [[ "$f" == "./.env" && -f "$target" ]]; then continue; fi
+    mkdir -p "$(dirname "$target")"
+    cp -f "$f" "$target"
+  done)
+  [[ ! -f "$PREFIX/.env" && -f "$PREFIX/.env.example" ]] && cp "$PREFIX/.env.example" "$PREFIX/.env"
+  log "  ${OK} 文件已全部就位"
+
+  # [6] 装 wrapper + 激活
+  log "${C_TITLE}[6/6]${C_RST} 装 wrapper + 立即生效"
+  local FLAG
+  if [[ "$LOADER" == "esm" && -f "$PREFIX/intercept.mjs" ]]; then
+    FLAG="--import=file://$PREFIX/intercept.mjs"
+  else
+    FLAG="--require=$PREFIX/intercept.cjs"
+  fi
+
+  case "$MODE" in
+  wrapper)
+    mkdir -p "$BIN_DIR"
+    cat > "$WRAPPER" << WRAPEOF
+#!/usr/bin/env bash
+if [[ "\${CLAUDE_INTERCEPT:-on}" != "off" ]]; then
+  export NODE_OPTIONS="$FLAG \${NODE_OPTIONS:-}"
+fi
+SELF=\$(realpath "\$0" 2>/dev/null || readlink -f "\$0")
+REAL=""
+IFS=':' read -ra PATHS <<< "\$PATH"
+for d in "\${PATHS[@]}"; do
+  for n in claude claude.cmd claude.sh; do
+    c="\$d/\$n"
+    if [[ -x "\$c" && "\$(realpath "\$c" 2>/dev/null || echo "\$c")" != "\$SELF" ]]; then
+      REAL="\$c"; break 2
+    fi
+  done
+done
+[[ -z "\$REAL" ]] && { echo "[node_helper] PATH 找不到真正的 claude" >&2; exit 127; }
+exec "\$REAL" "\$@"
+WRAPEOF
+    chmod +x "$WRAPPER"
+    log "  ${OK} wrapper: $WRAPPER"
+    ;;
+  global)
+    {
+      echo ""
+      echo "$MARK_BEGIN"
+      echo "export NODE_OPTIONS=\"$FLAG \${NODE_OPTIONS:-}\""
+      echo "$MARK_END"
+    } >> "$PROFILE"
+    log "  ${OK} 已写 $PROFILE"
+    ;;
+  esac
+
+  # 清 bash 命令缓存(只影响本 subshell,用户需自己再做一次)
+  hash -r 2>/dev/null || true
+
+  echo ""
+  log "${C_TITLE}━━━ 完成 ━━━${C_RST}"
+  local resolved
+  resolved=$(command -v claude 2>/dev/null || echo "(PATH 无 claude)")
+  log "  which claude  →  $resolved"
+
+  if [[ "$resolved" == "$WRAPPER" ]]; then
+    log "  ${OK} 包装器已生效"
+  else
+    log "  ${WARN} 当前 shell 命令缓存未刷新或 $BIN_DIR 不在 PATH 最前"
+    log ""
+    log "  在你的 shell 里执行这一行,立即生效:"
+    log ""
+    log "    ${C_TITLE}export PATH=\"$BIN_DIR:\$PATH\" && hash -r${C_RST}"
+    log ""
+    log "  或直接开新终端。"
+  fi
+  log ""
+  log "  验证:  CLAUDE_INTERCEPT_DEBUG=1 claude --version 2>&1 | head -3"
+  log "  看到 '[ic v3] active' 一行 = 拦截挂上"
+}
+
+
+# ============================================================
 #  [self-update]  只更新本脚本
 # ============================================================
 do_self_update() {
@@ -525,11 +699,12 @@ show_menu() {
   echo "   4) 编辑 .env 配置"
   echo "   5) 卸载"
   echo ""
+  echo "   7) ${C_TITLE}强制重置${C_RST}          (清状态 + 强制 GitHub 下载 + 重装 + 激活)"
   echo "   6) 自更新此脚本        (从 GitHub 拉最新的 node-helper.sh)"
   echo ""
   echo "   0) 退出"
   hr
-  read -r -p "  请选择 [0-6]: " choice
+  read -r -p "  请选择 [0-7]: " choice
   echo ""
   case "$choice" in
     1) do_install ;;
@@ -538,6 +713,7 @@ show_menu() {
     4) do_configure ;;
     5) do_uninstall ;;
     6) do_self_update ;;
+    7) do_reset ;;
     0|q|Q) log "再见"; exit 0 ;;
     *) log "${BAD} 无效选择"; sleep 1 ;;
   esac
@@ -567,6 +743,7 @@ main() {
   case "$cmd" in
     install)             do_install "$@" ;;
     update|upgrade)      do_update ;;
+    reset|fresh|force)   do_reset "$@" ;;
     status|st)           do_status ;;
     configure|config)    do_configure ;;
     uninstall|remove)    do_uninstall "$@" ;;
