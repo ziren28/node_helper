@@ -32,6 +32,14 @@ REPO_NAME="node_helper"
 REPO_BRANCH="main"
 RAW_BASE="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${REPO_BRANCH}"
 
+# Claude Code 版本锁定:2.1.112 是最后一个 JS 版
+# 2.1.113+ 改成 SEA 原生二进制,NODE_OPTIONS 会被忽略,我们的 hook 失效
+CLAUDE_CODE_VERSION="2.1.112"
+CLAUDE_CODE_TARBALL_URL="$RAW_BASE/vendor/claude-code-${CLAUDE_CODE_VERSION}.tgz"
+CLAUDE_CODE_NPM_FALLBACK="@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+CRON_FILE="/etc/cron.daily/node-helper-claude-lock"
+CRON_LOG="/var/log/node-helper-claude-lock.log"
+
 # 默认下载路径列表(相对于 RAW_BASE)
 REMOTE_FILES=(
   "intercept.cjs"
@@ -459,23 +467,156 @@ do_uninstall() {
   # 下载缓存
   [[ -d "$CACHE_DIR" ]] && confirm "清下载缓存 $CACHE_DIR ?" && rm -rf "$CACHE_DIR"
 
+  # cron 锁
+  if [[ -f "$CRON_FILE" ]] && grep -q "node_helper" "$CRON_FILE" 2>/dev/null; then
+    confirm "删 Claude 版本锁 cron($CRON_FILE)?" && rm -f "$CRON_FILE" && log "  $OK 已删"
+  fi
+  # 用户级 cron 条目
+  if crontab -l 2>/dev/null | grep -q "node-helper-claude-lock"; then
+    confirm "清用户 crontab 里的 node-helper-claude-lock 条目?" && \
+      (crontab -l 2>/dev/null | grep -v "node-helper-claude-lock" | crontab -) && log "  $OK 已清"
+  fi
+
   log ""
   log "卸载完成。which claude 当前 → $(command -v claude 2>/dev/null || echo '(无)')"
 }
+
+# ============================================================
+#  [lock-claude] 把 Claude Code 锁到 2.1.112(最后一个 JS 版)
+#  + 装每天检查、偏离就回滚的 cron
+#
+#  为什么 2.1.113+ 不能用:
+#    从 2.1.113 起 Anthropic 把包切成 SEA 原生二进制,
+#    Node 的 NODE_OPTIONS / --import / --require 全被锁死,
+#    我们所有 hook 方案对那个版本 无效。
+# ============================================================
+_claude_installed_version() {
+  local pj=/usr/lib/node_modules/@anthropic-ai/claude-code/package.json
+  [[ -f "$pj" ]] || { echo ""; return; }
+  grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' "$pj" \
+    | head -1 | sed 's/.*"\([^"]*\)"$/\1/'
+}
+
+do_lock_claude() {
+  require_cmd npm || die "需要 npm"
+
+  log ""
+  log "${C_TITLE}━━━ 锁定 Claude Code 到 $CLAUDE_CODE_VERSION ━━━${C_RST}"
+
+  local cur
+  cur=$(_claude_installed_version)
+  log "  当前:  ${cur:-(未装)}"
+  log "  目标:  $CLAUDE_CODE_VERSION"
+
+  if [[ "$cur" == "$CLAUDE_CODE_VERSION" ]]; then
+    log "  $OK 已是目标版本,跳过重装"
+  else
+    log ""
+    log "[1/2] 装 Claude Code $CLAUDE_CODE_VERSION"
+
+    # 如果装了其它版本,先卸
+    if [[ -n "$cur" ]]; then
+      npm uninstall -g @anthropic-ai/claude-code 2>&1 | sed 's/^/    /' | tail -3
+    fi
+
+    # 优先从本仓库的 vendor/ 拖 tarball(版本锁死、抗 Anthropic 下架);
+    # 失败再走 npm registry
+    local tarball="$CACHE_DIR/claude-code-${CLAUDE_CODE_VERSION}.tgz"
+    mkdir -p "$CACHE_DIR"
+    if http_get "$CLAUDE_CODE_TARBALL_URL" "$tarball" 2>/dev/null && [[ -s "$tarball" ]]; then
+      log "  ${OK} 已从 GitHub vendor/ 拉 tarball ($(du -h "$tarball" | cut -f1))"
+      npm install -g "$tarball" 2>&1 | sed 's/^/    /' | tail -3
+    else
+      log "  ${WARN} GitHub vendor 拉不到 tarball,回退到 npm registry"
+      npm install -g "$CLAUDE_CODE_NPM_FALLBACK" 2>&1 | sed 's/^/    /' | tail -3
+    fi
+
+    cur=$(_claude_installed_version)
+    if [[ "$cur" != "$CLAUDE_CODE_VERSION" ]]; then
+      log "  ${BAD} 装完后版本是 ${cur:-(空)},目标是 $CLAUDE_CODE_VERSION"
+      die "Claude Code 版本锁定失败"
+    fi
+    log "  ${OK} Claude Code $CLAUDE_CODE_VERSION 已装"
+  fi
+
+  log ""
+  log "[2/2] 安装防漂移 cron"
+
+  # 需要 root 才能写 /etc/cron.daily,非 root 用户 crontab
+  if [[ "$(id -u 2>/dev/null)" == "0" ]] && [[ -d /etc/cron.daily ]]; then
+    cat > "$CRON_FILE" << CRONEOF
+#!/bin/sh
+# node_helper · Claude Code 版本锁 —— 每天 cron.daily 检查一次,偏离就回滚
+# 目标版本:$CLAUDE_CODE_VERSION(最后一个 JS 版,2.1.113+ 是 SEA 不能 hook)
+set -e
+LOG="$CRON_LOG"
+TARGET="$CLAUDE_CODE_VERSION"
+PKG_JSON=/usr/lib/node_modules/@anthropic-ai/claude-code/package.json
+
+# 从 package.json 读版本,绕过 hook 避免 stderr 污染
+if [ -f "\$PKG_JSON" ]; then
+  CUR=\$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' "\$PKG_JSON" | head -1 | sed 's/.*"\([^"]*\)"\$/\1/')
+else
+  CUR=""
+fi
+
+if [ "\$CUR" != "\$TARGET" ]; then
+  echo "[\$(date -Iseconds)] drift: \${CUR:-none} -> reinstalling \$TARGET" >> "\$LOG"
+  /usr/bin/npm uninstall -g @anthropic-ai/claude-code >> "\$LOG" 2>&1 || true
+  TARBALL="$CACHE_DIR/claude-code-\$TARGET.tgz"
+  if [ -f "\$TARBALL" ]; then
+    /usr/bin/npm install -g "\$TARBALL" >> "\$LOG" 2>&1
+  else
+    /usr/bin/npm install -g "@anthropic-ai/claude-code@\$TARGET" >> "\$LOG" 2>&1
+  fi
+  NEW=\$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' "\$PKG_JSON" 2>/dev/null | head -1 | sed 's/.*"\([^"]*\)"\$/\1/' || echo "?")
+  echo "[\$(date -Iseconds)] now: \$NEW" >> "\$LOG"
+fi
+CRONEOF
+    chmod +x "$CRON_FILE"
+    log "  $OK 已装: $CRON_FILE"
+    log "  ${C_DIM}日志:$CRON_LOG${C_RST}"
+    # 干跑一次验证
+    if sh -n "$CRON_FILE" 2>/dev/null; then
+      log "  $OK 脚本语法检查通过"
+    fi
+  else
+    # 非 root:用户级 crontab
+    log "  ${WARN} 非 root,改用用户 crontab"
+    local user_script="$PREFIX/claude-lock.sh"
+    cat > "$user_script" << USEREOF
+#!/bin/sh
+# node_helper · Claude Code 版本锁(用户级)
+PKG_JSON=/usr/lib/node_modules/@anthropic-ai/claude-code/package.json
+[ -f "\$PKG_JSON" ] || exit 0
+CUR=\$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' "\$PKG_JSON" | head -1 | sed 's/.*"\([^"]*\)"\$/\1/')
+[ "\$CUR" = "$CLAUDE_CODE_VERSION" ] || npm install -g "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION" >> "\$HOME/.cache/claude-lock.log" 2>&1
+USEREOF
+    chmod +x "$user_script"
+    (crontab -l 2>/dev/null | grep -v node-helper-claude-lock; \
+     echo "0 3 * * * $user_script  # node-helper-claude-lock") | crontab -
+    log "  $OK 已装用户 crontab(每天 03:00 检查)"
+  fi
+
+  log ""
+  log "${OK} 完成。claude $(command -v claude) → $(claude --version 2>/dev/null | tail -1)"
+}
+
 
 # ============================================================
 #  [reset] 强制重置:清状态 -> 强制从 GitHub 下载 -> 重装 -> 激活
 #  无交互,适合一键修复挂载失败的情况
 # ============================================================
 do_reset() {
-  local MODE="wrapper" LOADER="esm"
+  local MODE="wrapper" LOADER="esm" LOCK_CLAUDE=1
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --global) MODE="global"; shift;;
-      --cjs)    LOADER="cjs"; shift;;
-      --esm)    LOADER="esm"; shift;;
-      --bin)    BIN_DIR="$2"; WRAPPER="$BIN_DIR/claude"; shift 2;;
-      --prefix) PREFIX="$2"; shift 2;;
+      --global)     MODE="global"; shift;;
+      --cjs)        LOADER="cjs"; shift;;
+      --esm)        LOADER="esm"; shift;;
+      --bin)        BIN_DIR="$2"; WRAPPER="$BIN_DIR/claude"; shift 2;;
+      --prefix)     PREFIX="$2"; shift 2;;
+      --no-claude)  LOCK_CLAUDE=0; shift;;   # 不锁 Claude Code 版本(专家模式)
       *) log "${WARN} 忽略未知参数: $1"; shift;;
     esac
   done
@@ -625,8 +766,17 @@ WRAPEOF
     log "  或直接开新终端。"
   fi
   log ""
-  log "  验证:  CLAUDE_INTERCEPT_DEBUG=1 claude --version 2>&1 | head -3"
-  log "  看到 '[ic v3] active' 一行 = 拦截挂上"
+
+  # 默认连 Claude Code 版本也一起锁(reset 的语义就是"确保一切可用")
+  if [[ "$LOCK_CLAUDE" == "1" ]]; then
+    do_lock_claude
+  else
+    log "  ${C_DIM}(--no-claude:跳过 Claude Code 版本锁)${C_RST}"
+  fi
+
+  log ""
+  log "  最终验证:  CLAUDE_INTERCEPT_DEBUG=1 claude --version 2>&1 | head -3"
+  log "  看到 '[ic v3] active' 一行 + 版本 $CLAUDE_CODE_VERSION = 完全成功"
 }
 
 
@@ -699,12 +849,13 @@ show_menu() {
   echo "   4) 编辑 .env 配置"
   echo "   5) 卸载"
   echo ""
-  echo "   7) ${C_TITLE}强制重置${C_RST}          (清状态 + 强制 GitHub 下载 + 重装 + 激活)"
+  echo "   7) ${C_TITLE}强制重置${C_RST}          (清 + 拉 + 重装 + 激活 + 锁 Claude $CLAUDE_CODE_VERSION)"
+  echo "   8) 只锁 Claude Code    (装/回滚到 $CLAUDE_CODE_VERSION + 加 cron 防漂移)"
   echo "   6) 自更新此脚本        (从 GitHub 拉最新的 node-helper.sh)"
   echo ""
   echo "   0) 退出"
   hr
-  read -r -p "  请选择 [0-7]: " choice
+  read -r -p "  请选择 [0-8]: " choice
   echo ""
   case "$choice" in
     1) do_install ;;
@@ -714,6 +865,7 @@ show_menu() {
     5) do_uninstall ;;
     6) do_self_update ;;
     7) do_reset ;;
+    8) do_lock_claude ;;
     0|q|Q) log "再见"; exit 0 ;;
     *) log "${BAD} 无效选择"; sleep 1 ;;
   esac
@@ -744,6 +896,7 @@ main() {
     install)             do_install "$@" ;;
     update|upgrade)      do_update ;;
     reset|fresh|force)   do_reset "$@" ;;
+    lock-claude|lock)    do_lock_claude ;;
     status|st)           do_status ;;
     configure|config)    do_configure ;;
     uninstall|remove)    do_uninstall "$@" ;;
