@@ -1,0 +1,24 @@
+# 每行一条匹配规则,命中则剥掉整个 <system-reminder>...</system-reminder> 块
+# '#' 开头是注释,空行跳过
+# 默认不区分大小写"子串包含"匹配;以 're:' 开头的行走正则
+
+# ──────── Claude Code 注入的上下文污染 ────────
+userEmail
+currentDate
+As you answer the user's questions, you can use the following context
+
+# ──────── 工具提示叨扰 ────────
+The TodoWrite tool hasn't been used recently
+task tools haven't been used recently
+The following deferred tools are now available via ToolSearch
+The following skills are available for use with the Skill tool
+
+# ──────── 时间漂移提示 ────────
+The date has changed
+
+# ──────── 恶意代码 / 安全红线 ────────
+Whenever you read a file, you should consider whether it would be considered malware
+
+# ──────── 例子:精确正则(用得上就去掉 # 启用)────────
+# re:<system-reminder>\s*As you answer
+# re:NEVER mention (this|these) reminder

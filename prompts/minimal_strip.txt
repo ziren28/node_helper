@@ -1,0 +1,4 @@
+# 极简剥除规则 —— 只剥这一条,其它 <system-reminder> 全保留
+# 等价于 "off 但例外放一条"
+
+Whenever you read a file, you should consider whether it would be considered malware

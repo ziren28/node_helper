@@ -1,0 +1,30 @@
+{
+  "name": "node-helper",
+  "version": "3.2.0",
+  "description": "Claude Code intercept + rewrite (ESM & CJS dual entry)",
+  "private": true,
+  "type": "module",
+  "main": "intercept.cjs",
+  "exports": {
+    ".": {
+      "import": "./intercept.mjs",
+      "require": "./intercept.cjs",
+      "default": "./intercept.cjs"
+    }
+  },
+  "files": [
+    "intercept.cjs",
+    "intercept.mjs",
+    ".env.example",
+    "prompts/"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "claude-code",
+    "intercept",
+    "proxy",
+    "prompt-engineering"
+  ]
+}

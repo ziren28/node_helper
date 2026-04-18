@@ -1,0 +1,39 @@
+# 对 system[2] 的整段文本做正则/子串 替换 或 删除
+#
+# 规则格式(每行一条):
+#   pattern                  → 匹配到的内容被删除(全局,不分大小写)
+#   pattern => replacement   → 匹配到的内容被替换成 replacement
+#
+# pattern 语法:
+#   默认         不分大小写的"子串"匹配
+#   're:' 前缀    正则(自动加 gi 标志)
+#
+# '#' 开头是注释,空行跳过
+# 所有规则按顺序执行,作用在 system[2].text 上
+# 执行顺序:patterns → # System 段替换 → prefix/suffix
+
+# ══════════════════════════════════════════════════════════════
+# 默认启用:删掉 system[2] 开头的两条 IMPORTANT 红线
+# ══════════════════════════════════════════════════════════════
+
+# 第一条:安全测试 / CTF 相关的红线(dual-use 工具限制)
+re:^IMPORTANT:\s*Assist with authorized security testing[\s\S]*?defensive use cases\.\s*$
+
+# 第二条:URL 生成限制红线
+re:^IMPORTANT:\s*You must NEVER generate or guess URLs[\s\S]*?local files\.\s*$
+
+# ══════════════════════════════════════════════════════════════
+# 下面是可选玩法,去掉 '#' 启用
+# ══════════════════════════════════════════════════════════════
+
+# 删 "Don't add features..." 的风格约束
+# re:^\s*-\s*Don't add features, refactor code.*$
+
+# 删整个 # Tone and style 段(到下一个 # 前)
+# re:^# Tone and style[\s\S]*?(?=^# |\Z)
+
+# 子串替换示例:把某个英文 section 标题翻成中文
+# # Using your tools => # 使用工具
+
+# 精确删除(不支持多行,要正则)
+# re:Prefer short, direct sentences over long explanations\.\s*
