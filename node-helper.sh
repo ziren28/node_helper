@@ -26,7 +26,7 @@ set -uo pipefail
 # ============================================================
 #  全局配置
 # ============================================================
-VERSION="3.2.0"
+VERSION="3.2.1"
 REPO_OWNER="ziren28"
 REPO_NAME="node_helper"
 REPO_BRANCH="main"
@@ -96,6 +96,97 @@ confirm() {
 }
 
 require_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+_claude_global_root() {
+  npm root -g 2>/dev/null || echo "/usr/local/lib/node_modules"
+}
+
+_claude_pkg_dir() {
+  local root d
+  root=$(_claude_global_root)
+  for d in \
+      "$root/@anthropic-ai/claude-code" \
+      "/usr/local/lib/node_modules/@anthropic-ai/claude-code" \
+      "/usr/lib/node_modules/@anthropic-ai/claude-code"; do
+    [[ -d "$d" ]] && { echo "$d"; return; }
+  done
+}
+
+_claude_pkg_json() {
+  local d
+  d=$(_claude_pkg_dir)
+  [[ -n "$d" && -f "$d/package.json" ]] && echo "$d/package.json"
+}
+
+_claude_real_cli() {
+  local d
+  d=$(_claude_pkg_dir)
+  [[ -n "$d" && -x "$d/cli.js" ]] && echo "$d/cli.js"
+}
+
+_claude_cli_valid() {
+  local real
+  real=$(_claude_real_cli)
+  [[ -n "$real" ]] || return 1
+  head -1 "$real" 2>/dev/null | grep -q "node"
+}
+
+_claude_restore_layout() {
+  local d real
+  d=$(_claude_pkg_dir)
+  real=$(_claude_real_cli)
+  [[ -n "$d" && -n "$real" ]] || return 0
+
+  # npm on Debian/Ubuntu installs global packages under /usr/local/lib/node_modules,
+  # while older node_helper releases checked /usr/lib/node_modules. Keep both views
+  # consistent, and park the real Claude CLI later in PATH so /usr/local/bin/claude
+  # can safely be the node_helper wrapper.
+  if [[ "$(id -u 2>/dev/null)" == "0" ]]; then
+    mkdir -p /usr/lib/node_modules/@anthropic-ai
+    if [[ "$d" != "/usr/lib/node_modules/@anthropic-ai/claude-code" ]]; then
+      rm -rf /usr/lib/node_modules/@anthropic-ai/claude-code
+      ln -s "$d" /usr/lib/node_modules/@anthropic-ai/claude-code
+    fi
+    ln -sf "$real" /usr/bin/claude
+  fi
+}
+
+write_node_helper_wrapper() {
+  local FLAG="$1"
+  local real
+  _claude_restore_layout 2>/dev/null || true
+  real=$(_claude_real_cli)
+
+  mkdir -p "$BIN_DIR"
+  # Important: if npm left /usr/local/bin/claude as a symlink to cli.js,
+  # redirecting into it would overwrite the real Claude CLI. Always unlink first.
+  rm -f "$WRAPPER"
+  cat > "$WRAPPER" << WRAPEOF
+#!/usr/bin/env bash
+# node_helper V3.2 wrapper · 临时禁用: CLAUDE_INTERCEPT=off claude ...
+if [[ "\${CLAUDE_INTERCEPT:-on}" != "off" ]]; then
+  export NODE_OPTIONS="$FLAG \${NODE_OPTIONS:-}"
+fi
+REAL_CANDIDATE="$real"
+if [[ -n "\$REAL_CANDIDATE" && -x "\$REAL_CANDIDATE" ]]; then
+  exec "\$REAL_CANDIDATE" "\$@"
+fi
+SELF=\$(realpath "\$0" 2>/dev/null || readlink -f "\$0")
+REAL=""
+IFS=':' read -ra PATHS <<< "\$PATH"
+for d in "\${PATHS[@]}"; do
+  for n in claude claude.cmd claude.sh; do
+    c="\$d/\$n"
+    if [[ -x "\$c" && "\$(realpath "\$c" 2>/dev/null || echo "\$c")" != "\$SELF" ]]; then
+      REAL="\$c"; break 2
+    fi
+  done
+done
+[[ -z "\$REAL" ]] && { echo "[node_helper] PATH 找不到真正的 claude" >&2; exit 127; }
+exec "\$REAL" "\$@"
+WRAPEOF
+  chmod +x "$WRAPPER"
+}
 
 # ============================================================
 #  HTTP 下载(curl 优先,wget 兜底)
@@ -244,28 +335,7 @@ do_install() {
 
   case "$MODE" in
   wrapper)
-    mkdir -p "$BIN_DIR"
-    cat > "$WRAPPER" << WRAPEOF
-#!/usr/bin/env bash
-# node_helper V3.2 wrapper · 临时禁用: CLAUDE_INTERCEPT=off claude ...
-if [[ "\${CLAUDE_INTERCEPT:-on}" != "off" ]]; then
-  export NODE_OPTIONS="$FLAG \${NODE_OPTIONS:-}"
-fi
-SELF=\$(realpath "\$0" 2>/dev/null || readlink -f "\$0")
-REAL=""
-IFS=':' read -ra PATHS <<< "\$PATH"
-for d in "\${PATHS[@]}"; do
-  for n in claude claude.cmd claude.sh; do
-    c="\$d/\$n"
-    if [[ -x "\$c" && "\$(realpath "\$c" 2>/dev/null || echo "\$c")" != "\$SELF" ]]; then
-      REAL="\$c"; break 2
-    fi
-  done
-done
-[[ -z "\$REAL" ]] && { echo "[node_helper] PATH 找不到真正的 claude" >&2; exit 127; }
-exec "\$REAL" "\$@"
-WRAPEOF
-    chmod +x "$WRAPPER"
+    write_node_helper_wrapper "$FLAG"
     log ""
     log "${OK} 已装 wrapper: $WRAPPER"
     if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
@@ -491,7 +561,8 @@ do_uninstall() {
 #    我们所有 hook 方案对那个版本 无效。
 # ============================================================
 _claude_installed_version() {
-  local pj=/usr/lib/node_modules/@anthropic-ai/claude-code/package.json
+  local pj
+  pj=$(_claude_pkg_json)
   [[ -f "$pj" ]] || { echo ""; return; }
   grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' "$pj" \
     | head -1 | sed 's/.*"\([^"]*\)"$/\1/'
@@ -508,7 +579,7 @@ do_lock_claude() {
   log "  当前:  ${cur:-(未装)}"
   log "  目标:  $CLAUDE_CODE_VERSION"
 
-  if [[ "$cur" == "$CLAUDE_CODE_VERSION" ]]; then
+  if [[ "$cur" == "$CLAUDE_CODE_VERSION" ]] && _claude_cli_valid; then
     log "  $OK 已是目标版本,跳过重装"
   else
     log ""
@@ -523,55 +594,114 @@ do_lock_claude() {
     # 失败再走 npm registry
     local tarball="$CACHE_DIR/claude-code-${CLAUDE_CODE_VERSION}.tgz"
     mkdir -p "$CACHE_DIR"
+    # npm install -g 需要占用 /usr/local/bin/claude。若 wrapper 已存在,
+    # 先移除,避免 EEXIST; 若它是 npm symlink,也避免后续写 wrapper 时覆盖 cli.js。
+    rm -f "$WRAPPER" 2>/dev/null || true
     if http_get "$CLAUDE_CODE_TARBALL_URL" "$tarball" 2>/dev/null && [[ -s "$tarball" ]]; then
       log "  ${OK} 已从 GitHub vendor/ 拉 tarball ($(du -h "$tarball" | cut -f1))"
-      npm install -g "$tarball" 2>&1 | sed 's/^/    /' | tail -3
+      npm install -g --force "$tarball" 2>&1 | sed 's/^/    /' | tail -3
     else
       log "  ${WARN} GitHub vendor 拉不到 tarball,回退到 npm registry"
-      npm install -g "$CLAUDE_CODE_NPM_FALLBACK" 2>&1 | sed 's/^/    /' | tail -3
+      npm install -g --force "$CLAUDE_CODE_NPM_FALLBACK" 2>&1 | sed 's/^/    /' | tail -3
     fi
 
+    _claude_restore_layout
+
     cur=$(_claude_installed_version)
-    if [[ "$cur" != "$CLAUDE_CODE_VERSION" ]]; then
+    if [[ "$cur" != "$CLAUDE_CODE_VERSION" ]] || ! _claude_cli_valid; then
       log "  ${BAD} 装完后版本是 ${cur:-(空)},目标是 $CLAUDE_CODE_VERSION"
       die "Claude Code 版本锁定失败"
     fi
     log "  ${OK} Claude Code $CLAUDE_CODE_VERSION 已装"
   fi
+  _claude_restore_layout
 
   log ""
   log "[2/2] 安装防漂移 cron"
 
   # 需要 root 才能写 /etc/cron.daily,非 root 用户 crontab
   if [[ "$(id -u 2>/dev/null)" == "0" ]] && [[ -d /etc/cron.daily ]]; then
+    local cron_flag
+    if [[ -f "$PREFIX/intercept.mjs" ]]; then
+      cron_flag="--import=file://$PREFIX/intercept.mjs"
+    else
+      cron_flag="--require=$PREFIX/intercept.cjs"
+    fi
     cat > "$CRON_FILE" << CRONEOF
-#!/bin/sh
+#!/usr/bin/env bash
 # node_helper · Claude Code 版本锁 —— 每天 cron.daily 检查一次,偏离就回滚
 # 目标版本:$CLAUDE_CODE_VERSION(最后一个 JS 版,2.1.113+ 是 SEA 不能 hook)
-set -e
+set -u
 LOG="$CRON_LOG"
 TARGET="$CLAUDE_CODE_VERSION"
-PKG_JSON=/usr/lib/node_modules/@anthropic-ai/claude-code/package.json
+WRAPPER="$WRAPPER"
+HELPER_PREFIX="$PREFIX"
+FLAG="$cron_flag"
+CACHE_DIR="$CACHE_DIR"
+TARBALL_URL="$CLAUDE_CODE_TARBALL_URL"
+NPM_FALLBACK="$CLAUDE_CODE_NPM_FALLBACK"
 
-# 从 package.json 读版本,绕过 hook 避免 stderr 污染
-if [ -f "\$PKG_JSON" ]; then
-  CUR=\$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' "\$PKG_JSON" | head -1 | sed 's/.*"\([^"]*\)"\$/\1/')
-else
-  CUR=""
-fi
-
-if [ "\$CUR" != "\$TARGET" ]; then
-  echo "[\$(date -Iseconds)] drift: \${CUR:-none} -> reinstalling \$TARGET" >> "\$LOG"
-  /usr/bin/npm uninstall -g @anthropic-ai/claude-code >> "\$LOG" 2>&1 || true
-  TARBALL="$CACHE_DIR/claude-code-\$TARGET.tgz"
-  if [ -f "\$TARBALL" ]; then
-    /usr/bin/npm install -g "\$TARBALL" >> "\$LOG" 2>&1
+log() { printf '[%s] %s\\n' "\$(date -Iseconds)" "\$*" >> "\$LOG"; }
+global_root() { /usr/bin/npm root -g 2>/dev/null || echo "/usr/local/lib/node_modules"; }
+pkg_dir() {
+  local root d
+  root=\$(global_root)
+  for d in "\$root/@anthropic-ai/claude-code" "/usr/local/lib/node_modules/@anthropic-ai/claude-code" "/usr/lib/node_modules/@anthropic-ai/claude-code"; do
+    [ -d "\$d" ] && { echo "\$d"; return; }
+  done
+}
+version() {
+  local d
+  d=\$(pkg_dir)
+  [ -n "\$d" ] || return 0
+  /usr/bin/node -e "try{console.log(require(process.argv[1]).version || '')}catch(e){}" "\$d/package.json" 2>/dev/null || true
+}
+cli_valid() {
+  local d
+  d=\$(pkg_dir)
+  [ -n "\$d" ] && [ -x "\$d/cli.js" ] && head -1 "\$d/cli.js" 2>/dev/null | grep -q node
+}
+install_target() {
+  mkdir -p "\$CACHE_DIR"
+  local tarball="\$CACHE_DIR/claude-code-\$TARGET.tgz"
+  rm -f "\$WRAPPER"
+  if command -v curl >/dev/null 2>&1 && curl -fsSL "\$TARBALL_URL" -o "\$tarball"; then
+    /usr/bin/npm install -g --force "\$tarball" >> "\$LOG" 2>&1
   else
-    /usr/bin/npm install -g "@anthropic-ai/claude-code@\$TARGET" >> "\$LOG" 2>&1
+    /usr/bin/npm install -g --force "\$NPM_FALLBACK" >> "\$LOG" 2>&1
   fi
-  NEW=\$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' "\$PKG_JSON" 2>/dev/null | head -1 | sed 's/.*"\([^"]*\)"\$/\1/' || echo "?")
-  echo "[\$(date -Iseconds)] now: \$NEW" >> "\$LOG"
+}
+restore_layout() {
+  local d real
+  d=\$(pkg_dir)
+  [ -n "\$d" ] || return 0
+  real="\$d/cli.js"
+  [ -x "\$real" ] || return 0
+  mkdir -p /usr/lib/node_modules/@anthropic-ai
+  if [ "\$d" != "/usr/lib/node_modules/@anthropic-ai/claude-code" ]; then
+    rm -rf /usr/lib/node_modules/@anthropic-ai/claude-code
+    ln -s "\$d" /usr/lib/node_modules/@anthropic-ai/claude-code
+  fi
+  ln -sf "\$real" /usr/bin/claude
+  rm -f "\$WRAPPER"
+  cat > "\$WRAPPER" << WRAPEOF
+#!/usr/bin/env bash
+if [[ "\\\${CLAUDE_INTERCEPT:-on}" != "off" ]]; then
+  export NODE_OPTIONS="$cron_flag \\\${NODE_OPTIONS:-}"
 fi
+exec "\$real" "\\\$@"
+WRAPEOF
+  chmod 0755 "\$WRAPPER"
+}
+
+CUR=\$(version)
+if [ "\$CUR" != "\$TARGET" ] || ! cli_valid; then
+  log "drift: \${CUR:-none} -> reinstalling \$TARGET"
+  install_target
+fi
+restore_layout
+NEW=\$(version)
+log "ok: claude-code=\${NEW:-unknown} wrapper=\$WRAPPER"
 CRONEOF
     chmod +x "$CRON_FILE"
     log "  $OK 已装: $CRON_FILE"
@@ -709,29 +839,18 @@ do_reset() {
     FLAG="--require=$PREFIX/intercept.cjs"
   fi
 
+  # 默认连 Claude Code 版本也一起锁(reset 的语义就是"确保一切可用")。
+  # 必须先锁 Claude,再写 wrapper;否则 npm install -g 会和 wrapper 抢
+  # /usr/local/bin/claude,甚至把 symlink 指向的 cli.js 覆盖掉。
+  if [[ "$LOCK_CLAUDE" == "1" ]]; then
+    do_lock_claude
+  else
+    log "  ${C_DIM}(--no-claude:跳过 Claude Code 版本锁)${C_RST}"
+  fi
+
   case "$MODE" in
   wrapper)
-    mkdir -p "$BIN_DIR"
-    cat > "$WRAPPER" << WRAPEOF
-#!/usr/bin/env bash
-if [[ "\${CLAUDE_INTERCEPT:-on}" != "off" ]]; then
-  export NODE_OPTIONS="$FLAG \${NODE_OPTIONS:-}"
-fi
-SELF=\$(realpath "\$0" 2>/dev/null || readlink -f "\$0")
-REAL=""
-IFS=':' read -ra PATHS <<< "\$PATH"
-for d in "\${PATHS[@]}"; do
-  for n in claude claude.cmd claude.sh; do
-    c="\$d/\$n"
-    if [[ -x "\$c" && "\$(realpath "\$c" 2>/dev/null || echo "\$c")" != "\$SELF" ]]; then
-      REAL="\$c"; break 2
-    fi
-  done
-done
-[[ -z "\$REAL" ]] && { echo "[node_helper] PATH 找不到真正的 claude" >&2; exit 127; }
-exec "\$REAL" "\$@"
-WRAPEOF
-    chmod +x "$WRAPPER"
+    write_node_helper_wrapper "$FLAG"
     log "  ${OK} wrapper: $WRAPPER"
     ;;
   global)
@@ -766,13 +885,6 @@ WRAPEOF
     log "  或直接开新终端。"
   fi
   log ""
-
-  # 默认连 Claude Code 版本也一起锁(reset 的语义就是"确保一切可用")
-  if [[ "$LOCK_CLAUDE" == "1" ]]; then
-    do_lock_claude
-  else
-    log "  ${C_DIM}(--no-claude:跳过 Claude Code 版本锁)${C_RST}"
-  fi
 
   log ""
   log "  最终验证:  CLAUDE_INTERCEPT_DEBUG=1 claude --version 2>&1 | head -3"
